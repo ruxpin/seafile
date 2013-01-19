@@ -273,24 +273,37 @@ out:
 }
 
 int
-seaf_repo_verify_passwd (SeafRepo *repo, const char *passwd)
+seaf_repo_verify_passwd (const char *repo_id,
+                         const char *passwd,
+                         const char *magic)
 {
     GString *buf = g_string_new (NULL);
     unsigned char key[16], iv[16];
     char hex[33];
 
     /* Recompute the magic and compare it with the one comes with the repo. */
-    g_string_append_printf (buf, "%s%s", repo->id, passwd);
+    g_string_append_printf (buf, "%s%s", repo_id, passwd);
 
-    seafile_generate_enc_key (buf->str, buf->len, repo->enc_version, key, iv);
+    seafile_generate_enc_key (buf->str, buf->len, CURRENT_ENC_VERSION, key, iv);
 
     g_string_free (buf, TRUE);
     rawdata_to_hex (key, hex, 16);
 
-    if (strcmp (hex, repo->magic) == 0)
+    if (g_strcmp0 (hex, magic) == 0)
         return 0;
     else
         return -1;
+}
+
+static inline gboolean
+has_trailing_space (const char *path)
+{
+    int len = strlen(path);
+    if (path[len - 1] == ' ') {
+        return TRUE;
+    }
+
+    return FALSE;
 }
 
 static gboolean
@@ -301,6 +314,13 @@ should_ignore(const char *filename, void *data)
     /* Ignore file/dir if its name is too long. */
     if (strlen(filename) >= SEAF_DIR_NAME_LEN)
         return TRUE;
+
+    if (has_trailing_space (filename)) {
+        /* Ignore files/dir whose path has trailing spaces. It would cause
+         * problem on windows. */
+        /* g_debug ("ignore '%s' which contains trailing space in path\n", path); */
+        return TRUE;
+    }
 
     while (*spec) {
         if (g_pattern_match_string(*spec, filename))
@@ -350,17 +370,6 @@ index_cb (const char *path,
     return 0;
 }
 
-static inline gboolean
-has_trailing_space (const char *path)
-{
-    int len = strlen(path);
-    if (path[len - 1] == ' ') {
-        return TRUE;
-    }
-
-    return FALSE;
-}
-
 static int
 add_recursive (struct index_state *istate, 
                const char *worktree,
@@ -375,13 +384,6 @@ add_recursive (struct index_state *istate,
     SeafStat st;
     int n;
     int ret = 0;
-
-    if (has_trailing_space (path)) {
-        /* Ignore files/dir whose path has trailing spaces. It would cause
-         * problem on windows. */
-        /* g_debug ("ignore '%s' which contains trailing space in path\n", path); */
-        return 0;
-    }
 
     full_path = g_build_path (PATH_SEPERATOR, worktree, path, NULL);
     if (seaf_stat (full_path, &st) < 0) {
@@ -817,6 +819,12 @@ seaf_repo_is_worktree_changed (SeafRepo *repo)
     struct index_state istate;
     char index_path[SEAF_PATH_MAX];
 
+    DiffEntry *de;
+    int pos;
+    struct cache_entry *ce;
+    struct stat sb;
+    char *full_path;
+
     if (!check_worktree_common (repo))
         return FALSE;
 
@@ -850,12 +858,41 @@ seaf_repo_is_worktree_changed (SeafRepo *repo)
     return FALSE;
 
 changed:
-    discard_index (&istate);
+
+    g_message ("Worktree changes (at most 5 files are shown):\n");
+    int i = 0;
+    for (p = res; p != NULL && i < 5; p = p->next, ++i) {
+        de = p->data;
+
+        full_path = g_build_path ("/", repo->worktree, de->name, NULL);
+        if (seaf_stat (full_path, &sb) < 0) {
+            g_warning ("Failed to stat %s: %s.\n", full_path, strerror(errno));
+            g_free (full_path);
+            continue;
+        }
+        g_free (full_path);
+
+        pos = index_name_pos (&istate, de->name, strlen(de->name));
+        if (pos < 0) {
+            g_warning ("Cannot find diff entry %s in index.\n", de->name);
+            continue;
+        }
+        ce = istate.cache[pos];
+
+        g_message ("type: %c, status: %c, name: %s, "
+                   "ce mtime: %d, ce size: %llu, "
+                   "file mtime: %d, file size: %llu\n",
+                   de->type, de->status, de->name,
+                   ce->ce_mtime.sec, ce->ce_size, (int)sb.st_mtime, sb.st_size);
+    }
+
     for (p = res; p; p = p->next) {
-        DiffEntry *de = p->data;
+        de = p->data;
         diff_entry_free (de);
     }
     g_list_free (res);
+
+    discard_index (&istate);
 
     repo->wt_changed = TRUE;
 
